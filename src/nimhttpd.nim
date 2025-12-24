@@ -24,9 +24,14 @@ const
   addressDefault4 = "127.0.0.1"
   addressDefault6 = "0:0:0:0:0:0:0:1"
   portDefault = 1337
+  maxFileSizeDefault = 1024 * 1024 * 1024  # 1 GB default limit
+  maxUrlLength = 8192  # 8 KB URL length limit
+
+var
+  maxFileSize = maxFileSizeDefault
   
 let usage = """ $1 v$2 - $3
-  (c) 2014-2023 $4
+  (c) 2014-2025 $4
 
   Usage:
     nimhttpd [-p:port] [directory]
@@ -41,8 +46,9 @@ let usage = """ $1 v$2 - $3
     -s, --sort     Sort. Can be None or Name. (default: None)
     -a, --address  The IPv4 address to listen to (default: $6).
     -6, --ipv6     The IPv6 address to listen to (default: $7).
+    -L, --limit    Size limit of files to offer for download in bytes (default: $8).
     -H  --header   Add a custom header. Multiple headers can be added.
-""" % [name, version, description, author, $portDefault, $addressDefault4, $addressDefault6]
+""" % [name, version, description, author, $portDefault, $addressDefault4, $addressDefault6, $maxFileSizeDefault]
 
 
 type 
@@ -105,23 +111,45 @@ proc relativeParent(path, cwd: string): string =
   var relparent = path.parentDir.relativePath(cwd)
   if relparent == "":
     return "/"
-  else: 
+  else:
     return relparent
 
-proc sendNotFound(settings: NimHttpSettings, path: string): NimHttpResponse = 
-  var content = "<p>The page you requested cannot be found.<p>"
+proc isPathSafe(path: string, rootDir: string): bool =
+  ## Validates that the given path is within the allowed root directory.
+  ## Returns true if the path is safe to serve, false otherwise.
+  let absolutePath = path.absolutePath
+  let absoluteRoot = rootDir.absolutePath
+  return absolutePath.startsWith(absoluteRoot)
+
+proc sendNotFound(settings: NimHttpSettings, path: string): NimHttpResponse =
+  var content = "<p>The page you requested cannot be found.</p>"
   return (code: Http404, content: hPage(settings, content, $int(Http404), "Not Found"), headers: {"Content-Type": "text/html"}.newHttpHeaders())
 
 proc sendNotImplemented(settings: NimHttpSettings, path: string): NimHttpResponse =
   var content = "<p>This server does not support the functionality required to fulfill the request.</p>"
   return (code: Http501, content: hPage(settings, content, $int(Http501), "Not Implemented"), headers: {"Content-Type": "text/html"}.newHttpHeaders())
 
+proc sendEntityTooLarge(settings: NimHttpSettings, path: string): NimHttpResponse =
+  var content = "<p>The requested file is too large to serve.</p>"
+  return (code: Http413, content: hPage(settings, content, $int(Http413), "Request Entity Too Large"), headers: {"Content-Type": "text/html"}.newHttpHeaders())
+
+proc sendUriTooLong(settings: NimHttpSettings): NimHttpResponse =
+  var content = "<p>The requested URL is too long.</p>"
+  return (code: Http414, content: hPage(settings, content, $int(Http414), "URI Too Long"), headers: {"Content-Type": "text/html"}.newHttpHeaders())
+
 proc sendStaticFile(settings: NimHttpSettings, path: string): NimHttpResponse =
+  # Check file size before reading
+  let fileSize = path.getFileSize()
+  if fileSize > maxFileSize:
+    return sendEntityTooLarge(settings, path)
+
   var
     mimes = settings.mimes
     ext = path.splitFile.ext
-  if ext == "": ext = ".txt" else: ext = ext[1 .. ^1]
-  let mimetype = mimes.getMimetype(ext.toLowerAscii)
+  let mimetype = if ext == "":
+    "application/octet-stream"  # Default for files without extension
+  else:
+    mimes.getMimetype(ext[1 .. ^1].toLowerAscii)
   var file = path.readFile
   return (code: Http200, content: file, headers: {"Content-Type": mimetype}.newHttpHeaders)
 
@@ -137,14 +165,13 @@ iterator walk(path: string, sort: SortType): string =
     for i in f:
       yield i
 
-proc sendDirContents(settings: NimHttpSettings, dir: string): NimHttpResponse = 
+proc sendDirContents(settings: NimHttpSettings, dir: string): NimHttpResponse =
   var
     res: NimHttpResponse
     cwd = settings.directory.absolutePath
     files = newSeq[string](0)
     path = dir.absolutePath
-  if not path.startsWith(cwd):
-    path = cwd
+  # Path safety is validated before this function is called
   if path != cwd and path != cwd&"/" and path != cwd&"\\":
     files.add """<li class="i-back entypo"><a href="$1">..</a></li>""" % [path.relativeParent(cwd)]
   var title = settings.title
@@ -182,20 +209,32 @@ proc genMsg(settings: NimHttpSettings): string =
   let t = now()
   let pid = getCurrentProcessId()
   result = """$1 v$2
-Address (IPv4): http://$3:$5
-Address (IPv6): http://$4:$5
-Directory:      $6
-Current Time:   $7 
-PID:            $8""" % [settings.name, settings.version, settings.address4, settings.address6, $settings.port, settings.directory.quoteShell, $t, $pid]
+Address (IPv4):   http://$3:$5
+Address (IPv6):   http://[$4]:$5
+Directory:        $6
+File size limit:  $7
+Current Time:     $8
+PID:              $9""" % [settings.name, settings.version, settings.address4, settings.address6, $settings.port, settings.directory.quoteShell, $maxFileSize, $t, $pid]
 
 proc serve*(settings: NimHttpSettings) =
   var server = newAsyncHttpServer()
   proc handleHttpRequest(req: Request): Future[void] {.async.} =
     printReqInfo(settings, req)
-    let path = settings.directory/req.url.path.replace("%20", " ").decodeUrl()
-    var res: NimHttpResponse 
+
+    # Check URL length
+    if req.url.path.len > maxUrlLength:
+      let res = sendUriTooLong(settings)
+      await req.respond(res.code, res.content, res.headers)
+      return
+
+    let path = settings.directory/req.url.path.decodeUrl()
+    var res: NimHttpResponse
     res.headers = settings.headers
-    if req.reqMethod != HttpGet:
+
+    # Validate path is within allowed directory (prevent path traversal)
+    if not isPathSafe(path, settings.directory):
+      res = sendNotFound(settings, path)
+    elif req.reqMethod != HttpGet:
       res = sendNotImplemented(settings, path)
     elif path.dirExists:
       res = sendDirContents(settings, path)
@@ -249,6 +288,16 @@ when isMainModule:
           else:
             echo "Error: Invalid port: '", val, "'"
             echo "Running on default port instead."
+      of "limit", "L":
+        try:
+          maxFileSize = val.parseInt
+        except CatchableError:
+          if val == "":
+            echo "Limit not set."
+            quit(2)
+          else:
+            echo "Error: Invalid limit: '", val, "'"
+            echo "Running with default limit instead."
       of "header", "H":
         let (key, values) = parseHeader(val)
         headers[key] = values
@@ -257,7 +306,7 @@ when isMainModule:
           of "name":
             sort = sortName
           else:
-            echo "Sort need be 'name' if set"  # TODO: more sorts
+            echo "Sort must be 'name' if set"  # TODO: more sorts
             quit(3)
       else:
         discard
@@ -270,7 +319,7 @@ when isMainModule:
       if dir.dirExists:
         www = expandFilename dir
       else:
-        echo "Error: Directory '"&dir&"' does not exist."
+        echo "Error: Specified directory does not exist."
         quit(1)
     else: 
       discard
